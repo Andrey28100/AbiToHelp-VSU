@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODERATOR_TG_ID = os.getenv("MODER_ID")
-BOT_USERNAME = "abitohelp_bot"  # ← замени, если имя бота другое
+BOT_USERNAME = "abitohelp_bot"
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не найден в .env")
@@ -128,7 +128,6 @@ def notif_toggle_kb(events_on: bool) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# === Вспомогательная функция: показ профиля + регистраций другого пользователя ===
 async def show_user_profile_preview(chat_id: int, target_id: int, viewer_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -166,8 +165,6 @@ async def show_user_profile_preview(chat_id: int, target_id: int, viewer_id: int
 
     await bot.send_message(chat_id, text, parse_mode="HTML")
 
-
-# === Обработчики ===
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -300,7 +297,6 @@ async def handle_callback(callback: types.CallbackQuery):
     user = callback.from_user
     data = callback.data
 
-    # === Регистрация на мероприятие (БЕЗ QR!) ===
     if data.startswith("reg_"):
         try:
             event_id = int(data.split("_", 1)[1])
@@ -329,7 +325,6 @@ async def handle_callback(callback: types.CallbackQuery):
             )
             await db.commit()
 
-        # ✅ УБРАН QR! Просто подтверждение.
         await callback.message.edit_reply_markup(reply_markup=event_registered_kb())
         await callback.answer("✅ Регистрация подтверждена!", show_alert=True)
         return
@@ -424,7 +419,6 @@ async def handle_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# === Запуск ===
 async def main():
     await init_db()
     me = await bot.get_me()
