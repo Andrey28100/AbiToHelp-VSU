@@ -131,6 +131,10 @@ class Broadcast(StatesGroup):
 class UserSearch(StatesGroup):
     waiting_for_query = State()
 
+class Feedback(StatesGroup):
+    bug = State()
+    event_help = State()
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -299,6 +303,15 @@ def events_hub_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 Ваши регистрации и QR-коды", callback_data="qr_for_checkin")
     builder.button(text="🔍 Активные мероприятия", callback_data="active_events")
+    builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def feedback_menu_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🐞 Сообщить об ошибке", callback_data="feedback_bug")
+    builder.button(text="🗓️ Помощь по мероприятию", callback_data="feedback_event_help")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
     return builder.as_markup()
@@ -920,6 +933,52 @@ async def process_status_text(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Статус пользователя {target_id} обновлён: {status}")
     await state.clear()
 
+@dp.message(Feedback.bug)
+async def process_bug_report(message: types.Message, state: FSMContext):
+    await send_feedback_to_moderators(
+        message=message,
+        feedback_type="❌ ОШИБКА В БОТЕ",
+        state=state
+    )
+
+@dp.message(Feedback.event_help)
+async def process_event_help(message: types.Message, state: FSMContext):
+    await send_feedback_to_moderators(
+        message=message,
+        feedback_type="ℹ️ ПОМОЩЬ ПО МЕРОПРИЯТИЮ",
+        state=state
+    )
+
+
+async def send_feedback_to_moderators(message: types.Message, feedback_type: str, state: FSMContext):
+    user = message.from_user
+    full_name = f"{user.first_name} {user.last_name or ''}".strip()
+    username = f"@{user.username}" if user.username else "не указан"
+    
+    report_text = (
+        f"{feedback_type}\n\n"
+        f"👤 Пользователь: {full_name}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"🔖 Юзернейм: {username}\n"
+        f"──────────────\n"
+        f"{message.text or 'Текст отсутствует'}"
+    )
+
+    # Отправляем модератору
+    try:
+        await bot.send_message(
+            chat_id=MODERATOR_TG_ID,
+            text=report_text,
+            parse_mode="HTML"
+        )
+        # Если у модератора роль в БД — можно отправить всем модерам
+    except Exception as e:
+        print(f"[Feedback] Не удалось отправить модератору: {e}")
+
+    # Подтверждение пользователю
+    await message.answer("✅ Ваше сообщение отправлено команде поддержки! Спасибо за обратную связь.")
+    await state.clear()
+
 
 # === Обработчик кнопок — ТОЛЬКО edit_caption! ===
 
@@ -1110,6 +1169,35 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
                 reply_markup=notif_toggle_kb(events_on, news_on),
                 parse_mode="HTML"
             )
+        await callback.answer()
+        return
+
+    if data == "feedback_menu":
+        text = (
+            "📩 <b>Обратная связь</b>\n\n"
+            "Выберите тип обращения:\n"
+            "• <b>Ошибка</b> — если бот работает неправильно\n"
+            "• <b>Помощь</b> — если нужна поддержка по мероприятию"
+        )
+        reverse_media = await get_media_asset("reverse")
+        media = InputMediaAnimation(
+                media=reverse_media,
+                caption=text,
+                parse_mode="HTML"
+            )
+        await callback.message.edit_media(media=media, reply_markup=feedback_menu_kb(), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if data == "feedback_bug":
+        await state.set_state(Feedback.bug)
+        await callback.message.answer("🐞 Опишите ошибку как можно подробнее:\n\n• Что вы делали?\n• Что пошло не так?\n• Были ли скриншоты?")
+        await callback.answer()
+        return
+
+    if data == "feedback_event_help":
+        await state.set_state(Feedback.event_help)
+        await callback.message.answer("🗓️ Укажите, по какому мероприятию нужна помощь и в чём проблема:")
         await callback.answer()
         return
 
