@@ -139,6 +139,7 @@ async def init_db():
             full_name TEXT,
             username TEXT,
             role TEXT DEFAULT 'applicant' CHECK(role IN ('applicant', 'student', 'curator', 'moderator')),
+            status TEXT DEFAULT 'Не зачислен',
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
 
@@ -221,6 +222,29 @@ def generate_qr_gif(data: str) -> BytesIO:
     return gif_bio
 
 
+async def show_event_by_index(message: types.Message, events: list, index: int, state: FSMContext):
+    event_id, title, reg_deadline, photo_id = events[index]
+    text = f"🎉 <b>{title}</b>\n⏳ Регистрация до: {reg_deadline}"
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Зарегистрироваться", callback_data=f"reg_{event_id}")
+    
+    if len(events) > 1:
+        if index > 0:
+            builder.button(text="⬅️", callback_data=f"nav_event_{index-1}")
+        if index < len(events) - 1:
+            builder.button(text="➡️", callback_data=f"nav_event_{index+1}")
+    
+    builder.button(text="⤴️ К списку", callback_data="events_hub")
+    builder.adjust(1, 2 if (index > 0 or index < len(events) - 1) else 1)
+
+    if photo_id:
+        media = InputMediaPhoto(media=photo_id, caption=text, parse_mode="HTML")
+        await message.edit_media(media=media, reply_markup=builder.as_markup())
+    else:
+        await message.edit_text(text=text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+
 async def has_admin_access(tg_id: int) -> bool:
     if tg_id == MODERATOR_TG_ID:
         return True
@@ -261,12 +285,20 @@ async def start_user_search(message: types.Message, state: FSMContext):
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    # Первая строка: О боте + Новости
     builder.button(text="ℹ️ О боте", callback_data="about_bot")
-    builder.button(text="👤 Мой профиль", callback_data="my_profile")
     builder.button(text="📰 Новости", callback_data="latest_news")
-    builder.button(text="📅 Активные мероприятия", callback_data="active_events")
+    builder.button(text="👤 Мой профиль", callback_data="my_profile")
+    builder.button(text="📅 Мероприятия", callback_data="events_hub")  # ← изменено
     builder.button(text="🔔 Настройки уведомлений", callback_data="notif_settings")
+    builder.adjust(2, 1, 1, 1)
+    return builder.as_markup()
+
+
+def events_hub_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 Ваши регистрации и QR-коды", callback_data="qr_for_checkin")
+    builder.button(text="🔍 Активные мероприятия", callback_data="active_events")
+    builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -302,7 +334,6 @@ def event_register_kb(event_id: int) -> InlineKeyboardMarkup:
 
 def profile_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="✌️ QR для отметки", callback_data="qr_for_checkin")
     builder.button(text="🎫 Мой QR-код", callback_data="my_qr_card")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
@@ -311,13 +342,14 @@ def profile_kb() -> InlineKeyboardMarkup:
 
 def qr_code_checkin_kb( ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Назад", callback_data=f"qr_for_checkin")
+    builder.button(text="⬅️ Назад", callback_data=f"events_hub")
     return builder.as_markup()
 
 
 def event_registered_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Зарегистрировано", callback_data="noop")
+    builder.button(text="⤴️ К списку", callback_data="events_hub")
     return builder.as_markup()
 
 
@@ -887,7 +919,7 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
             await db.commit()
 
         await callback.message.edit_reply_markup(reply_markup=event_registered_kb())
-        await callback.answer("✅ Регистрация подтверждена! Вы можете найти QR-код для входа на мероприятие в своём профиле.", show_alert=True)
+        await callback.answer("✅ Регистрация подтверждена! Вы можете найти QR-код для входа на мероприятие в своих регистрациях.", show_alert=True)
         return
 
     if data == "noop":
@@ -920,43 +952,49 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
         return
 
     if data == "my_profile":
-        # Получаем видео, если есть
         profile_video_id = await get_media_asset("profile")
-        text = ""
         
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                "SELECT full_name, username, role FROM users WHERE tg_id = ?",
+                "SELECT full_name, username, role, status FROM users WHERE tg_id = ?",
                 (user.id,)
             )
             row = await cursor.fetchone()
             if not row:
                 text = "❌ Профиль не найден. Напишите /start."
             else:
-                full_name, username, role = row
-                role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
+                full_name, username, role, status = row
+                role_name = {
+                    "applicant": "Абитуриент",
+                    "student": "Студент",
+                    "curator": "Куратор",
+                    "moderator": "Модератор"
+                }.get(role, role)
 
+                # Метрики по мероприятиям
                 cursor = await db.execute("""
-                    SELECT e.title, e.event_datetime, r.status, r.attended
-                    FROM events e
-                    JOIN registrations r ON e.id = r.event_id
+                    SELECT 
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (WHERE attended = 1) AS visited
+                    FROM registrations r
+                    JOIN events e ON r.event_id = e.id
                     WHERE r.user_id = ?
                 """, (user.id,))
-                events = await cursor.fetchall()
+                total, visited = await cursor.fetchone()
 
-                if events:
-                    lines = []
-                    for title, dt, status, attended in events:
-                        if attended:
-                            mark = "👤 Посетил"
-                        else:
-                            mark = "✅ Зарегистрирован"
-                        lines.append(f"• {title} ({dt}) — {mark}")
-                    text += "\n\n📋 Ваши мероприятия:\n" + "\n".join(lines)
-                else:
-                    text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
+                # Формируем текст профиля
+                text = f"👤 <b>{full_name}</b>\n\n"
+                text += f"🆔 ID: <code>{user.id}</code>\n"
+                text += f"🎭 Роль: {role_name}\n"
+                if status:
+                    text += f"🔖 Статус: {status}\n"
+                text += f"📊 Мероприятия: {visited} из {total} посещено\n"
 
-        # Отправляем ВИДЕО + текст, если видео есть, иначе только текст
+                # Дополнительно: если пользователь — абитуриент, даем совет
+                if role == "applicant":
+                    text += "\n💡 <i>Подайте документы заранее и посещайте дни открытых дверей!</i>"
+
+        # Отправляем
         if profile_video_id:
             media = InputMediaAnimation(
                 media=profile_video_id,
@@ -969,8 +1007,9 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
                 parse_mode="HTML"
             )
         else:
-            await callback.message.edit_caption(
-                caption=text,
+            # ВАЖНО: используем edit_text, а не edit_caption, чтобы избежать ошибок!
+            await callback.message.edit_text(
+                text=text,
                 reply_markup=profile_kb(),
                 parse_mode="HTML"
             )
@@ -1082,6 +1121,22 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
+    if data == "events_hub":
+        text = "📅 <b>Мероприятия</b>\n\nВыберите раздел:"
+        notif_video_id = await get_media_asset("hub")
+        media = InputMediaAnimation(
+                media=notif_video_id,
+                caption=text,
+                parse_mode="HTML"
+            )
+        await callback.message.edit_media(
+            media=media,
+            reply_markup=events_hub_kb(),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
     if data == "qr_for_checkin":
         # Получаем список мероприятий
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1102,7 +1157,9 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
                 caption=error_caption,
                 parse_mode="HTML"
             )
-            await callback.message.edit_media(media=fallback_media, reply_markup=back_kb())
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⬅️ Назад", callback_data="events_hub")
+            await callback.message.edit_media(media=fallback_media, reply_markup=builder.as_markup())
             await callback.answer()
             return
 
@@ -1125,7 +1182,7 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
                 text=title[:20] + ("..." if len(title) > 20 else ""),
                 callback_data=f"gen_qr_checkin_{event_id}"
             )
-        builder.button(text="⬅️ Назад", callback_data="my_profile")
+        builder.button(text="⬅️ Назад", callback_data="events_hub")
         builder.adjust(1)
 
         await callback.message.edit_media(
@@ -1158,7 +1215,6 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
 
         async with aiosqlite.connect(DB_PATH) as db:
-            # Выбираем мероприятия, где регистрация ещё открыта И пользователь не зарегистрирован
             cursor = await db.execute("""
                 SELECT e.id, e.title, e.registration_deadline, e.photo_file_id
                 FROM events e
@@ -1172,40 +1228,38 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
             events = await cursor.fetchall()
 
         if not events:
-            regs_file_id = await get_media_asset("regs")
-            media = InputMediaAnimation(
-                media=regs_file_id,
-                caption="📭 Нет мероприятий с открытой регистрацией.",
-                parse_mode="HTML"
-            )
-            await callback.message.edit_media(
-                media=media,
+            await callback.message.edit_text(
+                "📭 Нет мероприятий с открытой регистрацией.",
                 reply_markup=back_kb(),
                 parse_mode="HTML"
             )
             await callback.answer()
             return
 
-        # Покажем первое мероприятие
-        event_id, title, reg_deadline, photo_id = events[0]
-        text = f"🎉 <b>{title}</b>\n⏳ Регистрация до: {reg_deadline}"
-
-        # Клавиатура с навигацией
-        builder = InlineKeyboardBuilder()
-        builder.button(text="✅ Зарегистрироваться", callback_data=f"reg_{event_id}")
-        if len(events) > 1:
-            builder.button(text="⏭️ Далее", callback_data=f"next_event_0")  # индекс текущего
-        builder.button(text="⬅️ Назад", callback_data="back_to_main")
-        builder.adjust(1)
-
-        if photo_id:
-            media = InputMediaPhoto(media=photo_id, caption=text, parse_mode="HTML")
-            await callback.message.edit_media(media=media, reply_markup=builder.as_markup())
-        else:
-            await callback.message.edit_text(text=text, reply_markup=builder.as_markup(), parse_mode="HTML")
-
-        # Сохрани список в state (для навигации)
+        # Сохраняем список мероприятий в state
+        await state.update_data(active_events=events)
+        
+        # Показываем первое (индекс 0)
+        await show_event_by_index(callback.message, events, 0, state)
         await callback.answer()
+        return
+
+    if data.startswith("nav_event_"):
+        try:
+            index = int(data.split("_", 2)[2])
+        except (ValueError, IndexError):
+            await callback.answer("❌ Ошибка навигации.")
+            return
+
+        user_data = await state.get_data()
+        events = user_data.get("active_events")
+        if not events or index < 0 or index >= len(events):
+            await callback.answer("❌ Список устарел. Обновите.")
+            return
+
+        await show_event_by_index(callback.message, events, index, state)
+        await callback.answer()
+        return
 
     if data == "latest_news":
         try:
