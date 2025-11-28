@@ -9,6 +9,9 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, BufferedInputFile, InputMediaAnimation
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,10 +32,26 @@ WELCOME_GIF_BYTES = None
 MODER_GIF_BYTES = None
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 
 # === Вспомогательные функции ===
+
+class EventCreation(StatesGroup):
+    title = State()
+    description = State()
+    event_datetime = State()  # формат: ГГГГ-ММ-ДД ЧЧ:ММ
+    location = State()
+
+class RoleAssignment(StatesGroup):
+    waiting_for_user_id = State()
+    waiting_for_role = State()
+
+class Broadcast(StatesGroup):
+    waiting_for_message = State()
+
+class UserSearch(StatesGroup):
+    waiting_for_query = State()
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -142,6 +161,33 @@ async def has_admin_access(tg_id: int) -> bool:
         return bool(row and row[0] == "moderator")
 
 
+async def start_event_creation(message: types.Message, state: FSMContext):
+    await message.answer("✏️ Введите <b>название</b> мероприятия:", parse_mode="HTML")
+    await state.set_state(EventCreation.title)
+
+
+async def start_role_assignment(message: types.Message, state: FSMContext):
+    await message.answer("👤 Введите <b>Telegram ID</b> пользователя:", parse_mode="HTML")
+    await state.set_state(RoleAssignment.waiting_for_user_id)
+
+
+async def start_broadcast(message: types.Message, state: FSMContext):
+    await message.answer(
+        "📨 Отправьте текст (или текст + фото/видео) для рассылки.\n"
+        "Поддерживается HTML-разметка и медиа."
+    )
+    await state.set_state(Broadcast.waiting_for_message)
+
+
+async def start_user_search(message: types.Message, state: FSMContext):
+    await message.answer(
+        "🔍 Введите <b>Telegram ID</b> пользователя или часть имени:\n"
+        "Пример: <code>123456789</code> или <code>Иван</code>",
+        parse_mode="HTML"
+    )
+    await state.set_state(UserSearch.waiting_for_query)
+
+
 # === Клавиатуры ===
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -187,6 +233,12 @@ def profile_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✌️ QR для отметки", callback_data="qr_for_checkin")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    return builder.as_markup()
+
+
+def qr_code_checkin_kb( ) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data=f"qr_for_checkin")
     return builder.as_markup()
 
 
@@ -255,7 +307,7 @@ async def cmd_start(message: types.Message):
             # Ставим attended = 1
             await db.execute("""
                 UPDATE registrations
-                SET attended = 1
+                SET status = "attended"
                 WHERE user_id = ? AND event_id = ?
             """, (attendee_id, event_id))
             await db.commit()
@@ -327,40 +379,72 @@ async def cmd_start(message: types.Message):
 # === Команды модератора (без изменений) ===
 
 @dp.message(Command("add_event"))
-async def cmd_add_event(message: types.Message):
+async def cmd_add_event_start(message: types.Message, state: FSMContext):
     if not await has_admin_access(message.from_user.id):
         await message.answer("⚠️ Только модератор может добавлять мероприятия.")
         return
+    await start_event_creation(message, state)
 
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
+
+@dp.message(EventCreation.title)
+async def process_title(message: types.Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await message.answer("📝 Введите <b>описание</b> мероприятия:", parse_mode="HTML")
+    await state.set_state(EventCreation.description)
+
+
+@dp.message(EventCreation.description)
+async def process_description(message: types.Message, state: FSMContext):
+    await state.update_data(description=message.text.strip())
+    await message.answer(
+        "📅 Введите <b>дату и время</b> мероприятия в формате:\n"
+        "<code>ГГГГ-ММ-ДД ЧЧ:ММ</code>\n\n"
+        "Пример: <code>2025-12-10 15:30</code>",
+        parse_mode="HTML"
+    )
+    await state.set_state(EventCreation.event_datetime)
+
+
+@dp.message(EventCreation.event_datetime)
+async def process_datetime(message: types.Message, state: FSMContext):
+    user_input = message.text.strip()
+    # Простая валидация формата
+    import re
+    if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", user_input):
         await message.answer(
-            "❗ Неверный формат.\n"
-            "Используйте:\n"
-            "/add_event Название | Описание | Дата (ГГГГ-ММ-ДД ЧЧ:ММ) | Место"
+            "❌ Неверный формат.\n"
+            "Пожалуйста, используйте: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>",
+            parse_mode="HTML"
         )
         return
 
-    payload = args[1].strip()
-    parts = payload.split(" | ")
-    if len(parts) != 4:
-        await message.answer(
-            "❗ Неверное количество параметров.\n"
-            "Нужно ровно 4, разделённых ` | `:\n"
-            "Название | Описание | Дата | Место"
-        )
-        return
+    await state.update_data(event_datetime=user_input)
+    await message.answer("📍 Введите <b>место проведения</b>:", parse_mode="HTML")
+    await state.set_state(EventCreation.location)
 
-    title, description, event_datetime, location = [p.strip() for p in parts]
 
+@dp.message(EventCreation.location)
+async def process_location(message: types.Message, state: FSMContext):
+    await state.update_data(location=message.text.strip())
+
+    # Получаем все данные
+    data = await state.get_data()
+    title = data["title"]
+    description = data["description"]
+    event_datetime = data["event_datetime"]
+    location = data["location"]
+    creator_id = message.from_user.id
+
+    # Сохраняем в БД
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             INSERT INTO events (title, description, event_datetime, location, created_by)
             VALUES (?, ?, ?, ?, ?)
-        """, (title, description, event_datetime, location, message.from_user.id))
+        """, (title, description, event_datetime, location, creator_id))
         event_id = cursor.lastrowid
         await db.commit()
 
+    # Отправляем пост
     event_tag = f"#event_{event_id}"
     post_text = (
         f"🎉 <b>{title}</b>\n\n"
@@ -371,8 +455,8 @@ async def cmd_add_event(message: types.Message):
     )
     sent_msg = await message.answer(post_text, parse_mode="HTML")
     await sent_msg.edit_reply_markup(reply_markup=event_register_kb(event_id))
-    await message.answer(f"✅ Мероприятие создано! ID: {event_id}")
 
+    # Рассылка
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             SELECT u.tg_id FROM users u
@@ -389,8 +473,11 @@ async def cmd_add_event(message: types.Message):
                 parse_mode="HTML",
                 reply_markup=event_register_kb(event_id)
             )
-        except:
-            pass
+        except Exception:
+            pass  # игнорируем заблокировавших
+
+    await message.answer(f"✅ Мероприятие создано! ID: {event_id}")
+    await state.clear()  # выходим из FSM
 
 
 @dp.message(Command("moder"))
@@ -415,36 +502,164 @@ async def cmd_moder(message: types.Message):
 
 
 @dp.message(Command("set_role"))
-async def cmd_set_role(message: types.Message):
+async def cmd_set_role_start(message: types.Message, state: FSMContext):
     if not await has_admin_access(message.from_user.id):
         await message.answer("⚠️ Только модератор может менять роли.")
         return
+    await start_role_assignment(message, state)
 
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("Используйте: /set_role <tg_id> <applicant|student|curator|moderator>")
-        return
 
+@dp.message(RoleAssignment.waiting_for_user_id)
+async def process_user_id(message: types.Message, state: FSMContext):
     try:
-        tg_id = int(args[1])
-        new_role = args[2]
-        if new_role not in ("applicant", "student", "curator", "moderator"):
-            raise ValueError
-    except (ValueError, TypeError):
-        await message.answer("❌ Некорректный ID или роль.")
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Некорректный ID. Попробуйте снова:")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT 1 FROM users WHERE tg_id = ?", (tg_id,))
+        cursor = await db.execute("SELECT 1 FROM users WHERE tg_id = ?", (user_id,))
         if not await cursor.fetchone():
-            await message.answer("❌ Пользователь не найден. Он должен написать боту /start.")
+            await message.answer(
+                "❌ Пользователь не найден. Убедитесь, что он писал боту /start.\n"
+                "Попробуйте снова:"
+            )
             return
 
-        await db.execute("UPDATE users SET role = ? WHERE tg_id = ?", (new_role, tg_id))
+    await state.update_data(target_user_id=user_id)
+    await message.answer(
+        "🔤 Введите новую роль:\n"
+        "<code>applicant</code>, <code>student</code>, <code>curator</code> или <code>moderator</code>",
+        parse_mode="HTML"
+    )
+    await state.set_state(RoleAssignment.waiting_for_role)
+
+
+@dp.message(RoleAssignment.waiting_for_role)
+async def process_role(message: types.Message, state: FSMContext):
+    role = message.text.strip()
+    if role not in ("applicant", "student", "curator", "moderator"):
+        await message.answer(
+            "❌ Недопустимая роль.\n"
+            "Используйте: <code>applicant</code>, <code>student</code>, <code>curator</code>, <code>moderator</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    target_id = data["target_user_id"]
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET role = ? WHERE tg_id = ?", (role, target_id))
         await db.commit()
 
-    role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}[new_role]
-    await message.answer(f"✅ Роль пользователя {tg_id} изменена на: {role_name}")
+    role_name = {
+        "applicant": "Абитуриент",
+        "student": "Студент",
+        "curator": "Куратор",
+        "moderator": "Модератор"
+    }[role]
+
+    await message.answer(f"✅ Роль пользователя {target_id} изменена на: {role_name}")
+    await state.clear()
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast_start(message: types.Message, state: FSMContext):
+    if not await has_admin_access(message.from_user.id):
+        await message.answer("⚠️ Только модератор может делать рассылку.")
+        return
+    await start_broadcast(message, state)
+
+
+@dp.message(Broadcast.waiting_for_message)
+async def process_broadcast_message(message: types.Message, state: FSMContext):
+    # Сохраняем исходное сообщение как шаблон
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT u.tg_id FROM users u
+            JOIN notification_prefs np ON u.tg_id = np.user_id
+            WHERE np.events_enabled = 1 OR np.news_enabled = 1
+        """)
+        recipients = await cursor.fetchall()
+
+    success_count = 0
+    total = len(recipients)
+
+    for (tg_id,) in recipients:
+        try:
+            # Пересылаем точно такое же сообщение
+            if message.text:
+                await bot.send_message(
+                    tg_id,
+                    message.text,
+                    parse_mode="HTML" if "<" in message.text else None
+                )
+            elif message.photo:
+                await bot.send_photo(
+                    tg_id,
+                    photo=message.photo[-1].file_id,
+                    caption=message.caption,
+                    parse_mode="HTML" if message.caption and "<" in message.caption else None
+                )
+            elif message.video:
+                await bot.send_video(
+                    tg_id,
+                    video=message.video.file_id,
+                    caption=message.caption,
+                    parse_mode="HTML" if message.caption and "<" in message.caption else None
+                )
+            elif message.animation:
+                await bot.send_animation(
+                    tg_id,
+                    animation=message.animation.file_id,
+                    caption=message.caption,
+                    parse_mode="HTML" if message.caption and "<" in message.caption else None
+                )
+            else:
+                await bot.send_message(tg_id, message.text or "Сообщение от модератора")
+            success_count += 1
+        except Exception:
+            pass  # пользователь заблокировал или удалил чат
+
+    await message.answer(f"📤 Рассылка отправлена {success_count} из {total} пользователей.")
+    await state.clear()
+
+
+@dp.message(Command("search_user"))
+async def cmd_search_user_start(message: types.Message, state: FSMContext):
+    if not await has_admin_access(message.from_user.id):
+        await message.answer("⚠️ Только модератор может искать пользователей.")
+        return
+    await start_user_search(message, state)
+
+
+@dp.message(UserSearch.waiting_for_query)
+async def process_user_search(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if query.isdigit():
+            cursor = await db.execute(
+                "SELECT tg_id, full_name, username, role FROM users WHERE tg_id = ?", (int(query),)
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT tg_id, full_name, username, role FROM users WHERE full_name LIKE ?", (f"%{query}%",)
+            )
+        users = await cursor.fetchall()
+
+    if not users:
+        await message.answer("❌ Пользователи не найдены.")
+    else:
+        text = f"👥 Найдено {len(users)} пользователей:\n\n"
+        for tg_id, full_name, username, role in users[:10]:  # максимум 10
+            role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
+            uname = f" (@{username})" if username else ""
+            text += f"• {full_name}{uname} | ID: <code>{tg_id}</code> | {role_name}\n"
+        await message.answer(text, parse_mode="HTML")
+
+    await state.clear()
 
 
 @dp.message(Command("set_video"))
@@ -483,10 +698,21 @@ async def cmd_set_video(message: types.Message):
     await message.answer(f"✅ Видео для '{key}' сохранено!")
 
 
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("Нет активной операции для отмены.")
+        return
+
+    await state.clear()
+    await message.answer("❌ Операция отменена. Вы можете начать заново.")
+
+
 # === Обработчик кнопок — ТОЛЬКО edit_caption! ===
 
 @dp.callback_query()
-async def handle_callback(callback: types.CallbackQuery):
+async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
     user = callback.from_user
     data = callback.data
 
@@ -519,7 +745,7 @@ async def handle_callback(callback: types.CallbackQuery):
             await db.commit()
 
         await callback.message.edit_reply_markup(reply_markup=event_registered_kb())
-        await callback.answer("✅ Регистрация подтверждена!", show_alert=True)
+        await callback.answer("✅ Регистрация подтверждена! Вы можете найти QR-код для входа на мероприятие в своём профиле.", show_alert=True)
         return
 
     if data == "noop":
@@ -528,7 +754,7 @@ async def handle_callback(callback: types.CallbackQuery):
 
     if data == "about_bot":
         about_video_id = await get_media_asset("about")
-        text = "ℹ️ <b>Бот абитуриента и студента ВГУ</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия. \nБот центра адаптации абитуриентов Воронежского государственного университета"
+        text = "ℹ️ <b>Бот абитуриента и студента ВГУ</b>\n\n• Помогает ориентироваться в университете и регистрироваться на мероприятия. \n• Бот центра адаптации абитуриентов Воронежского государственного университета"
 
         media = InputMediaAnimation(
             media=about_video_id,
@@ -723,14 +949,14 @@ async def handle_callback(callback: types.CallbackQuery):
 
         media = InputMediaAnimation(
                 media=BufferedInputFile(qr_gif.getvalue(), filename=f"qr_checkin_{event_id}.gif"),
-                caption=error_caption,
+                caption=f"🎫 QR для отметки на мероприятии\n\nПокажите его модератору при входе.",
                 parse_mode="HTML"
             )
 
         await callback.message.edit_media(
             media=media,
-            caption=f"🎫 QR для отметки на мероприятии\n\nПокажите его модератору при входе.",
-            reply_markup=back_kb()
+            reply_markup=qr_code_checkin_kb(),
+            parse_mode="HTML"
         )
         await callback.answer()
         return
@@ -751,47 +977,45 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "mod_create_event":
-        caption = (
-            "✏️ <b>Создание мероприятия</b>\n\n"
-            "Отправьте данные в формате:\n"
-            "<code>Название | Описание | Дата (ГГГГ-ММ-ДД ЧЧ:ММ) | Место</code>"
-        )
-        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
-        context = dp.get("mod_context", {})
-        context[callback.from_user.id] = "awaiting_event_data"
-        dp["mod_context"] = context
+        if not await has_admin_access(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        await state.set_state(EventCreation.title)
+        await callback.message.answer("✏️ Введите <b>название</b> мероприятия:", parse_mode="HTML")
         await callback.answer()
         return
 
     if data == "mod_set_role":
-        caption = (
-            "👤 <b>Назначение роли</b>\n\n"
-            "Отправьте в формате:\n"
-            "<code>tg_id роль</code>\n\n"
-            "Роли: <code>applicant</code>, <code>student</code>, <code>curator</code>, <code>moderator</code>"
-        )
-        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
-        context = dp.get("mod_context", {})
-        context[callback.from_user.id] = "awaiting_role_data"
-        dp["mod_context"] = context
-        await callback.answer()
-        return
-
-    if data == "mod_search_user":
-        caption = "🔍 <b>Поиск пользователя</b>\n\nОтправьте <b>Telegram ID</b> пользователя:"
-        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
-        context = dp.get("mod_context", {})
-        context[callback.from_user.id] = "awaiting_user_id"
-        dp["mod_context"] = context
+        if not await has_admin_access(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        await state.set_state(RoleAssignment.waiting_for_user_id)
+        await callback.message.answer("👤 Введите <b>Telegram ID</b> пользователя:", parse_mode="HTML")
         await callback.answer()
         return
 
     if data == "mod_broadcast":
-        caption = "📨 <b>Рассылка</b>\n\nОтправьте текст сообщения для всех пользователей с включёнными уведомлениями:"
-        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
-        context = dp.get("mod_context", {})
-        context[callback.from_user.id] = "awaiting_broadcast_text"
-        dp["mod_context"] = context
+        if not await has_admin_access(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        await state.set_state(Broadcast.waiting_for_message)
+        await callback.message.answer(
+            "📨 Отправьте текст (или текст + фото/видео) для рассылки.\n"
+            "Поддерживается HTML-разметка и медиа."
+        )
+        await callback.answer()
+        return
+
+    if data == "mod_search_user":
+        if not await has_admin_access(callback.from_user.id):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        await state.set_state(UserSearch.waiting_for_query)
+        await callback.message.answer(
+            "🔍 Введите <b>Telegram ID</b> пользователя или часть имени:\n"
+            "Пример: <code>123456789</code> или <code>Иван</code>",
+            parse_mode="HTML"
+        )
         await callback.answer()
         return
 
