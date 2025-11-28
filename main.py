@@ -191,6 +191,17 @@ async def init_db():
         )
         """)
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS locations (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            photo_file_id TEXT,
+            latitude REAL,
+            longitude REAL
+        )
+        """)
+
         await db.commit()
 
 
@@ -457,6 +468,38 @@ async def cmd_start(message: types.Message):
             f"👤 {attendee_name}\n"
             f"📅 {event_title}"
         )
+        return
+
+    # === Обработка QR-локаций ===
+    if payload and payload.startswith("location_"):
+        try:
+            loc_id = payload.split("_", 1)[1]
+        except IndexError:
+            await message.answer("❌ Некорректная ссылка на локацию.")
+            return
+
+        # Загружаем данные о локации
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT name, description, photo_file_id 
+                FROM locations 
+                WHERE id = ?
+            """, (loc_id,))
+            row = await cursor.fetchone()
+
+            if not row:
+                await message.answer("📍 Локация не найдена.")
+                return
+
+            name, description, photo_file_id = row
+            text = f"🏛 <b>{name}</b>\n\n{description}"
+
+            if photo_file_id:
+                await message.answer_photo(photo=photo_file_id, caption=text, parse_mode="HTML")
+            else:
+                await message.answer(text, parse_mode="HTML")
+
+        # Можно добавить кнопку "Посмотреть на карте" или "Ближайшие мероприятия"
         return
 
     if payload and payload.isdigit():
@@ -980,6 +1023,72 @@ async def send_feedback_to_moderators(message: types.Message, feedback_type: str
     await state.clear()
 
 
+class LocationCreation(StatesGroup):
+    location_id = State()
+    name = State()
+    description = State()
+    photo = State()
+
+@dp.message(Command("add_location"))
+async def cmd_add_location(message: types.Message, state: FSMContext):
+    if not await has_admin_access(message.from_user.id):
+        await message.answer("⚠️ Только модератор.")
+        return
+    await message.answer("🆔 Введите <b>уникальный ID локации</b> (латиницей, без пробелов):\nПример: main_corp, library, auditorium_301", parse_mode="HTML")
+    await state.set_state(LocationCreation.location_id)
+
+@dp.message(LocationCreation.location_id)
+async def process_loc_id(message: types.Message, state: FSMContext):
+    loc_id = message.text.strip()
+    if not loc_id.replace("_", "").replace("-", "").isalnum():
+        await message.answer("❌ ID должен содержать только буквы, цифры, _ или -.", parse_mode="HTML")
+        return
+    await state.update_data(location_id=loc_id)
+    await message.answer("🏷 Введите <b>название локации</b>:", parse_mode="HTML")
+    await state.set_state(LocationCreation.name)
+
+@dp.message(LocationCreation.name)
+async def process_loc_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("📝 Введите <b>описание</b> (можно оставить пустым):", parse_mode="HTML")
+    await state.set_state(LocationCreation.description)
+
+@dp.message(LocationCreation.description)
+async def process_loc_desc(message: types.Message, state: FSMContext):
+    await state.update_data(description=message.text or "")
+    await message.answer("📸 (Опционально) Отправьте фото локации или /skip:")
+    await state.set_state(LocationCreation.photo)
+
+@dp.message(Command("skip"))
+@dp.message(LocationCreation.photo)
+async def process_loc_photo(message: types.Message, state: FSMContext):
+    photo_file_id = message.photo[-1].file_id if message.photo else None
+    data = await state.get_data()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO locations (id, name, description, photo_file_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                photo_file_id = excluded.photo_file_id
+        """, (data["location_id"], data["name"], data["description"], photo_file_id))
+        await db.commit()
+
+    # Генерируем QR-код для этой локации
+    deeplink = f"https://t.me/{BOT_USERNAME}?start=location_{data['location_id']}"
+    qr_png = generate_qr(deeplink)
+    qr_file = BufferedInputFile(qr_png.getvalue(), filename=f"qr_loc_{data['location_id']}.png")
+
+    await message.answer_photo(
+        photo=qr_file,
+        caption=f"✅ Локация сохранена!\n\n🔗 Ссылка: <code>{deeplink}</code>",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
 # === Обработчик кнопок — ТОЛЬКО edit_caption! ===
 
 @dp.callback_query()
@@ -1134,6 +1243,7 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_media(media=media, reply_markup=back_kb(), parse_mode="HTML")
         await callback.answer()
         return
+
 
     if data == "notif_settings":
         async with aiosqlite.connect(DB_PATH) as db:
