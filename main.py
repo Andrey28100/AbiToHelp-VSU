@@ -9,6 +9,16 @@ from aiogram.types import InlineKeyboardMarkup, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
+WELCOME_GIF_PATH = "bot.mp4"
+
+def load_welcome_gif() -> bytes:
+    if not os.path.exists(WELCOME_GIF_PATH):
+        raise FileNotFoundError(f"Файл {WELCOME_GIF_PATH} не найден!")
+    with open(WELCOME_GIF_PATH, "rb") as f:
+        return f.read()
+
+WELCOME_GIF_BYTES = None        
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODERATOR_TG_ID = os.getenv("MODER_ID")
@@ -134,7 +144,6 @@ def notif_toggle_kb(events_on: bool) -> InlineKeyboardMarkup:
 async def cmd_start(message: types.Message):
     user = message.from_user
 
-    # Сохраняем пользователя
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (tg_id, full_name, username)
@@ -155,10 +164,10 @@ async def cmd_start(message: types.Message):
     if payload and payload.isdigit():
         target_id = int(payload)
         if target_id == user.id:
+            # Это своя визитка — НЕ показываем GIF
             await message.answer("✅ Вы перешли по своей QR-визитке!", reply_markup=back_kb())
-        # Внутри cmd_start, в блоке else (когда payload.isdigit()):
         else:
-            # Показываем профиль другого пользователя → новое сообщение
+            # Просмотр чужого профиля — НЕ показываем GIF
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute("SELECT full_name, username, role FROM users WHERE tg_id = ?", (target_id,))
                 row = await cursor.fetchone()
@@ -169,7 +178,6 @@ async def cmd_start(message: types.Message):
                     role_name = {"applicant": "Абитуриент", "moderator": "Модератор"}.get(role, role)
                     text = f"👤 <b>Профиль пользователя</b> (ID: {target_id})\n\nИмя: {full_name}\nРоль: {role_name}"
 
-                    # Мероприятия
                     cursor = await db.execute("""
                         SELECT e.title, e.event_datetime FROM events e
                         JOIN registrations r ON e.id = r.event_id
@@ -184,15 +192,19 @@ async def cmd_start(message: types.Message):
 
                     await message.answer(text, parse_mode="HTML")
     else:
-        await message.answer(
-            "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
-            "Здесь вы можете:\n"
-            "• Получить персональный QR-код\n"
-            "• Зарегистрироваться на мероприятия\n"
-            "• Настроить уведомления",
+        # Основной старт — ПОКАЗЫВАЕМ GIF
+        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
+        await message.answer_animation(
+            animation=gif_file,
+            caption=(
+                "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
+                "Здесь вы можете:\n"
+                "• Получить персональный QR-код\n"
+                "• Зарегистрироваться на мероприятия\n"
+                "• Настроить уведомления"
+            ),
             reply_markup=main_menu_kb()
         )
-
 
 @dp.message(Command("add_event"))
 async def cmd_add_event(message: types.Message):
@@ -358,8 +370,13 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "about_bot":
-        text = "🤖 <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия."
-        await callback.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
+        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
+        await callback.message.answer_animation(
+            animation=gif_file,
+            caption="🤖 <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия.",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
         await callback.answer()
         return
 
@@ -393,9 +410,16 @@ async def handle_callback(callback: types.CallbackQuery):
         else:
             text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
 
+        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
+        caption = text  # тот самый text с профилем
         builder = InlineKeyboardBuilder()
         builder.button(text="⬅️ Назад", callback_data="back_to_main")
-        await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        await callback.message.answer_animation(
+            animation=gif_file,
+            caption=caption,
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
         await callback.answer()
         return
 
@@ -417,7 +441,14 @@ async def handle_callback(callback: types.CallbackQuery):
             cursor = await db.execute("SELECT events_enabled FROM notification_prefs WHERE user_id = ?", (user.id,))
             row = await cursor.fetchone()
         events_on = bool(row[0]) if row else True
-        await callback.message.edit_text("🔔 <b>Настройки уведомлений</b>", reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
+
+        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
+        await callback.message.answer_animation(
+            animation=gif_file,
+            caption="🔔 <b>Настройки уведомлений</b>",
+            reply_markup=notif_toggle_kb(events_on),
+            parse_mode="HTML"
+        )
         await callback.answer()
         return
 
@@ -522,12 +553,16 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "back_to_main":
-        await callback.message.edit_text(
-            "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
-            "Здесь вы можете:\n"
-            "• Получить персональный QR-код\n"
-            "• Зарегистрироваться на мероприятия\n"
-            "• Настроить уведомления",
+        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
+        await callback.message.answer_animation(
+            animation=gif_file,
+            caption=(
+                "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
+                "Здесь вы можете:\n"
+                "• Получить персональный QR-код\n"
+                "• Зарегистрироваться на мероприятия\n"
+                "• Настроить уведомления"
+            ),
             reply_markup=main_menu_kb()
         )
         await callback.answer()
@@ -536,191 +571,9 @@ async def handle_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.message()
-async def handle_moder_input(message: types.Message):
-    user_id = message.from_user.id
-    if has_admin_access(user_id):
-        # Обычное поведение для абитуриентов — эхо
-        await message.answer(f" Echo: {message.text}")
-        return
-
-    # Проверяем, ожидаем ли мы ввод от модератора
-    context = dp.get("mod_context", {})
-    state = context.get(user_id)
-
-    if state == "awaiting_event_data":
-        del context[user_id]
-        dp["mod_context"] = context
-
-        parts = message.text.strip().split(" | ")
-        if len(parts) != 4:
-            await message.answer(
-                "❌ Неверный формат.\n"
-                "Нужно: <code>Название | Описание | Дата | Место</code>",
-                parse_mode="HTML"
-            )
-            # Вернуть в панель
-            await cmd_moder(message)
-            return
-
-        title, description, event_datetime, location = [p.strip() for p in parts]
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                INSERT INTO events (title, description, event_datetime, location, created_by)
-                VALUES (?, ?, ?, ?, ?)
-            """, (title, description, event_datetime, location, user_id))
-            event_id = cursor.lastrowid
-            await db.commit()
-
-        event_tag = f"#event_{event_id}"
-        post_text = (
-            f"🎉 <b>{title}</b>\n\n"
-            f"{description}\n\n"
-            f"📅 {event_datetime}\n"
-            f"📍 {location}\n\n"
-            f"{event_tag}"
-        )
-        sent_msg = await message.answer(post_text, parse_mode="HTML")
-        await sent_msg.edit_reply_markup(reply_markup=event_register_kb(event_id))
-
-        # Рассылка
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                SELECT u.tg_id FROM users u
-                JOIN notification_prefs np ON u.tg_id = np.user_id
-                WHERE np.events_enabled = 1
-            """)
-            users = await cursor.fetchall()
-
-        success = 0
-        for (tg_id,) in users:
-            try:
-                await bot.send_message(
-                    tg_id,
-                    f"📬 <b>Новое мероприятие!</b>\n\n{post_text}",
-                    parse_mode="HTML",
-                    reply_markup=event_register_kb(event_id)
-                )
-                success += 1
-            except:
-                pass
-
-        await message.answer(f"✅ Мероприятие создано! ID: {event_id}\nРассылка отправлена {success} пользователям.")
-        await cmd_moder(message)  # Вернуть в панель
-
-    elif state == "awaiting_role_data":
-        del context[user_id]
-        dp["mod_context"] = context
-
-        args = message.text.strip().split()
-        if len(args) != 2:
-            await message.answer("❌ Формат: <code>tg_id роль</code>", parse_mode="HTML")
-            await cmd_moder(message)
-            return
-
-        try:
-            tg_id = int(args[0])
-            new_role = args[1]
-            if new_role not in ("applicant", "student", "curator", "moderator"):
-                raise ValueError
-        except ValueError:
-            await message.answer("❌ Некорректный ID или роль.", parse_mode="HTML")
-            await cmd_moder(message)
-            return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT 1 FROM users WHERE tg_id = ?", (tg_id,))
-            if not await cursor.fetchone():
-                await message.answer("❌ Пользователь не найден. Он должен написать боту /start.")
-                await cmd_moder(message)
-                return
-
-            await db.execute("UPDATE users SET role = ? WHERE tg_id = ?", (new_role, tg_id))
-            await db.commit()
-
-        role_name = {
-            "applicant": "Абитуриент",
-            "student": "Студент",
-            "curator": "Куратор",
-            "moderator": "Модератор"
-        }[new_role]
-        await message.answer(f"✅ Роль пользователя {tg_id} изменена на: {role_name}")
-        await cmd_moder(message)
-
-    elif state == "awaiting_user_id":
-        del context[user_id]
-        dp["mod_context"] = context
-
-        try:
-            target_id = int(message.text.strip())
-        except ValueError:
-            await message.answer("❌ Неверный ID.")
-            await cmd_moder(message)
-            return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT full_name, username, role FROM users WHERE tg_id = ?", (target_id,))
-            row = await cursor.fetchone()
-            if not row:
-                await message.answer("❌ Пользователь не найден.")
-                await cmd_moder(message)
-                return
-
-            full_name, username, role = row
-            role_name = {
-                "applicant": "Абитуриент",
-                "student": "Студент",
-                "curator": "Куратор",
-                "moderator": "Модератор"
-            }.get(role, role)
-
-            cursor = await db.execute("""
-                SELECT e.title, e.event_datetime FROM events e
-                JOIN registrations r ON e.id = r.event_id
-                WHERE r.user_id = ?
-            """, (target_id,))
-            events = await cursor.fetchall()
-
-            text = f"👤 <b>Профиль пользователя</b> (ID: {target_id})\n\nИмя: {full_name}\nРоль: {role_name}"
-            if events:
-                text += "\n\n✅ Зарегистрирован на:\n" + "\n".join(f"• {title} ({dt})" for title, dt in events)
-            else:
-                text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
-
-            await message.answer(text, parse_mode="HTML")
-        await cmd_moder(message)
-
-    elif state == "awaiting_broadcast_text":
-        del context[user_id]
-        dp["mod_context"] = context
-
-        broadcast_text = message.text.strip()
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                SELECT u.tg_id FROM users u
-                JOIN notification_prefs np ON u.tg_id = np.user_id
-                WHERE np.events_enabled = 1
-            """)
-            users = await cursor.fetchall()
-
-        success = 0
-        for (tg_id,) in users:
-            try:
-                await bot.send_message(tg_id, f"📣 <b>Официальное уведомление:</b>\n\n{broadcast_text}", parse_mode="HTML")
-                success += 1
-            except:
-                pass
-
-        await message.answer(f"✅ Рассылка отправлена {success} пользователям.")
-        await cmd_moder(message)
-
-    else:
-        # Если модератор пишет вне контекста — тоже эхо (или игнор)
-        await message.answer("ℹ️ Используйте команду /moder для управления.")
-
-
 async def main():
+    global WELCOME_GIF_BYTES
+    WELCOME_GIF_BYTES = load_welcome_gif()
     await init_db()
     me = await bot.get_me()
     print(f"✅ Бот запущен как @{me.username}")
