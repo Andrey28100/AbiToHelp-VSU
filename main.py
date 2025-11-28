@@ -80,22 +80,22 @@ async def init_db():
             FOREIGN KEY(user_id) REFERENCES users(tg_id)
         )""")
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS media_assets (
+            key TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            description TEXT
+        )
+        """)
+
         await db.commit()
 
 
-def load_welcome_gif() -> bytes:
-    if not os.path.exists(WELCOME_GIF_PATH):
-        raise FileNotFoundError(f"Файл {WELCOME_GIF_PATH} не найден!")
-    with open(WELCOME_GIF_PATH, "rb") as f:
-        return f.read()
-
-
-def load_moder_gif() -> bytes:
-    if not os.path.exists(MODER_GIF_PATH):
-        # Fallback на основной GIF, если moder.mp4 нет
-        return load_welcome_gif()
-    with open(MODER_GIF_PATH, "rb") as f:
-        return f.read()
+async def get_media_asset(key: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT file_id FROM media_assets WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
 
 def generate_qr(data: str) -> BytesIO:
@@ -226,21 +226,27 @@ async def cmd_start(message: types.Message):
 
                     await message.answer(text, parse_mode="HTML")
     else:
-        # Главное меню — анимация с подписью и кнопками
-        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
-        await message.answer_animation(
-            animation=gif_file,
-            caption=(
-                "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
-                "Здесь вы можете:\n"
-                "• Получить персональный QR-код\n"
-                "• Зарегистрироваться на мероприятия\n"
-                "• Настроить уведомления"
-            ),
-            reply_markup=main_menu_kb(),
-            parse_mode="HTML"
+        welcome_file_id = await get_media_asset("welcome")
+        caption = (
+            "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
+            "Здесь вы можете:\n"
+            "• Получить персональный QR-код\n"
+            "• Зарегистрироваться на мероприятия\n"
+            "• Настроить уведомления"
         )
-
+        if welcome_file_id:
+            await message.answer_animation(
+                animation=welcome_file_id,
+                caption=caption,
+                reply_markup=main_menu_kb(),
+                parse_mode="HTML"
+            )
+        else:
+            # fallback: текст без видео
+            await message.answer(
+                caption,
+                reply_markup=main_menu_kb()
+            )
 
 # === Команды модератора (без изменений) ===
 
@@ -316,13 +322,20 @@ async def cmd_moder(message: types.Message):
     if not await has_admin_access(message.from_user.id):
         return
 
-    gif_file = BufferedInputFile(MODER_GIF_PATH, filename="moder.mp4")
-    await message.answer_animation(
-        animation=gif_file,
-        caption="🛠 <b>Панель модератора</b>",
-        reply_markup=moder_menu_kb(),
-        parse_mode="HTML"
-    )
+    moder_file_id = await get_media_asset("moder")
+    if moder_file_id:
+        await message.answer_animation(
+            animation=moder_file_id,
+            caption="🛠 <b>Панель модератора</b>",
+            reply_markup=moder_menu_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        # fallback: текст без видео
+        await message.answer(
+            "Панель модератора (Видео не задано)",
+            reply_markup=moder_menu_kb()
+        )
 
 
 @dp.message(Command("set_role"))
@@ -356,6 +369,42 @@ async def cmd_set_role(message: types.Message):
 
     role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}[new_role]
     await message.answer(f"✅ Роль пользователя {tg_id} изменена на: {role_name}")
+
+
+@dp.message(Command("set_video"))
+async def cmd_set_video(message: types.Message):
+    if not await has_admin_access(message.from_user.id):
+        await message.answer("⚠️ Только модератор.")
+        return
+
+    text = message.text or message.caption
+    if not text:
+        await message.answer("❗ Укажите ключ в подписи к видео. Пример: <code>/set_video welcome</code>", parse_mode="HTML")
+        return
+    args = text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Используйте: /set_video <ключ> (например, welcome, moder)")
+        return
+
+    key = args[1].strip()
+
+    if message.video:
+        file_id = message.video.file_id
+    elif message.animation:  # для GIF/MP4 как animation
+        file_id = message.animation.file_id
+    else:
+        await message.answer("Отправьте видео или анимацию вместе с командой (в подписи).")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO media_assets (key, file_id, description)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET file_id = excluded.file_id
+        """, (key, file_id, f"Видео для {key}"))
+        await db.commit()
+
+    await message.answer(f"✅ Видео для '{key}' сохранено!")
 
 
 # === Обработчик кнопок — ТОЛЬКО edit_caption! ===
@@ -569,9 +618,6 @@ async def handle_callback(callback: types.CallbackQuery):
 # === Запуск ===
 
 async def main():
-    global WELCOME_GIF_BYTES, MODER_GIF_PATH
-    WELCOME_GIF_BYTES = load_welcome_gif()
-    MODER_GIF_PATH = load_moder_gif()
     await init_db()
     me = await bot.get_me()
     print(f"✅ Бот запущен как @{me.username}")
