@@ -288,9 +288,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     builder.button(text="ℹ️ О боте", callback_data="about_bot")
     builder.button(text="📰 Новости", callback_data="latest_news")
     builder.button(text="👤 Мой профиль", callback_data="my_profile")
-    builder.button(text="📅 Мероприятия", callback_data="events_hub")  # ← изменено
+    builder.button(text="📅 Мероприятия", callback_data="events_hub")
+    builder.button(text="📩 Обратная связь", callback_data="feedback_menu")
     builder.button(text="🔔 Настройки уведомлений", callback_data="notif_settings")
-    builder.adjust(2, 1, 1, 1)
+    builder.adjust(2, 1, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -883,6 +884,43 @@ async def cmd_set_video(message: types.Message):
     await message.answer(f"✅ Видео для '{key}' сохранено!")
 
 
+class SetStatus(StatesGroup):
+    waiting_for_user_id = State()
+    waiting_for_status = State()
+
+@dp.message(Command("set_status"))
+async def cmd_set_status_start(message: types.Message, state: FSMContext):
+    if not await has_admin_access(message.from_user.id):
+        await message.answer("⚠️ Только модератор.")
+        return
+    await message.answer("👤 Введите Telegram ID пользователя:")
+    await state.set_state(SetStatus.waiting_for_user_id)
+
+@dp.message(SetStatus.waiting_for_user_id)
+async def process_status_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Некорректный ID. Попробуйте снова:")
+        return
+    await state.update_data(target_user_id=user_id)
+    await message.answer("✏️ Введите новый статус (например: «Подал документы», «Зачислен»):")
+    await state.set_state(SetStatus.waiting_for_status)
+
+@dp.message(SetStatus.waiting_for_status)
+async def process_status_text(message: types.Message, state: FSMContext):
+    status = message.text.strip()
+    data = await state.get_data()
+    target_id = data["target_user_id"]
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET status = ? WHERE tg_id = ?", (status, target_id))
+        await db.commit()
+
+    await message.answer(f"✅ Статус пользователя {target_id} обновлён: {status}")
+    await state.clear()
+
+
 # === Обработчик кнопок — ТОЛЬКО edit_caption! ===
 
 @dp.callback_query()
@@ -1031,6 +1069,9 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
             caption=caption,
             parse_mode="HTML"
         )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ Назад", callback_data="my_profile")
+
         await callback.message.edit_media(media=media, reply_markup=back_kb(), parse_mode="HTML")
         await callback.answer()
         return
@@ -1228,9 +1269,17 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
             events = await cursor.fetchall()
 
         if not events:
-            await callback.message.edit_text(
-                "📭 Нет мероприятий с открытой регистрацией.",
-                reply_markup=back_kb(),
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⬅️ Назад", callback_data="events_hub")
+            active_video = await get_media_asset("actives")
+            media = InputMediaAnimation(
+                media=active_video,
+                caption="📭 Нет мероприятий с открытой регистрацией.",
+                parse_mode="HTML"
+            )
+            await callback.message.edit_media(
+                media=media,
+                reply_markup=builder.as_markup(),
                 parse_mode="HTML"
             )
             await callback.answer()
